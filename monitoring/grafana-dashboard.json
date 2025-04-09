@@ -1,0 +1,37 @@
+{
+    "dashboard": {
+        "title": "Legal DMS Monitoring Dashboard",
+        "panels": [
+            {
+                "type": "graph",
+                "title": "CPU Usage",
+                "targets": [
+                    {
+                        "expr": "sum(rate(container_cpu_usage_seconds_total[5m])) by (pod)",
+                        "legendFormat": "{{pod}}"
+                    }
+                ]
+            },
+            {
+                "type": "graph",
+                "title": "Memory Usage",
+                "targets": [
+                    {
+                        "expr": "sum(container_memory_usage_bytes) by (pod)",
+                        "legendFormat": "{{pod}}"
+                    }
+                ]
+            },
+            {
+                "type": "table",
+                "title": "Pod Status",
+                "targets": [
+                    {
+                        "expr": "kube_pod_status_phase",
+                        "legendFormat": "{{pod}}: {{phase}}"
+                    }
+                ]
+            }
+        ]
+    }
+}

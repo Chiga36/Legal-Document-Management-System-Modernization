@@ -1,0 +1,247 @@
+pipeline {
+    agent any
+    
+    options {
+        timeout(time: 1, unit: 'HOURS')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+    
+    environment {
+        DOCKER_REGISTRY = 'registry.example.com'
+        APP_NAME = 'legal-dms'
+        DOCKER_CREDS = credentials('docker-registry-credentials')
+        KUBECONFIG = credentials('kubernetes-config')
+        SONAR_TOKEN = credentials('sonar-token')
+        SLACK_CHANNEL = '#legal-dms-deployments'
+    }
+    
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['dev', 'qa', 'staging', 'prod'], description: 'Deployment environment')
+        booleanParam(name: 'RUN_TESTS', defaultValue: true, description: 'Run tests before building?')
+        booleanParam(name: 'SECURITY_SCAN', defaultValue: true, description: 'Run security scans?')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.IMAGE_TAG = "${params.ENVIRONMENT}-${env.GIT_COMMIT_SHORT}-${env.BUILD_NUMBER}"
+                    env.BUILD_TIMESTAMP = sh(script: 'date +%Y%m%d%H%M%S', returnStdout: true).trim()
+                }
+            }
+        }
+        
+        stage('Static Analysis') {
+            when {
+                expression { return params.RUN_TESTS }
+            }
+            parallel {
+                stage('ESLint') {
+                    steps {
+                        dir('src/frontend') {
+                            sh 'npm ci'
+                            sh 'npm run lint'
+                        }
+                    }
+                }
+                stage('Backend Linting') {
+                    steps {
+                        dir('src/backend') {
+                            sh 'npm ci'
+                            sh 'npm run lint'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Unit Tests') {
+            when {
+                expression { return params.RUN_TESTS }
+            }
+            parallel {
+                stage('Frontend Tests') {
+                    steps {
+                        dir('src/frontend') {
+                            sh 'npm test -- --coverage'
+                            junit 'coverage/junit.xml'
+                        }
+                    }
+                    post {
+                        always {
+                            publishHTML(target: [
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'src/frontend/coverage/lcov-report',
+                                reportFiles: 'index.html',
+                                reportName: 'Frontend Coverage Report'
+                            ])
+                        }
+                    }
+                }
+                stage('Backend Tests') {
+                    steps {
+                        dir('src/backend') {
+                            sh 'npm test -- --coverage'
+                            junit 'coverage/junit.xml'
+                        }
+                    }
+                    post {
+                        always {
+                            publishHTML(target: [
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'src/backend/coverage/lcov-report',
+                                reportFiles: 'index.html',
+                                reportName: 'Backend Coverage Report'
+                            ])
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('SonarQube Analysis') {
+            when {
+                expression { return params.RUN_TESTS }
+            }
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        sonar-scanner \
+                          -Dsonar.projectKey=${APP_NAME} \
+                          -Dsonar.projectName="Legal DMS" \
+                          -Dsonar.sources=src \
+                          -Dsonar.javascript.lcov.reportPaths=src/frontend/coverage/lcov.info,src/backend/coverage/lcov.info \
+                          -Dsonar.exclusions=**/node_modules/**,**/coverage/**,**/dist/**,**/build/**,**/*.test.js \
+                          -Dsonar.tests=src/frontend/src/**/*.test.js,src/backend/test/**/*.test.js
+                    '''
+                }
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            when {
+                expression { return params.SECURITY_SCAN }
+            }
+            steps {
+                parallel(
+                    dependencyCheck: {
+                        sh 'ci-cd/scripts/dependency-check.sh'
+                    },
+                    containerScan: {
+                        sh 'ci-cd/scripts/trivy-scan.sh'
+                    },
+                    secretsScan: {
+                        sh 'ci-cd/scripts/detect-secrets.sh'
+                    }
+                )
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'security-reports/**/*', fingerprint: true
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                sh "ci-cd/scripts/build.sh --env ${params.ENVIRONMENT} --tag ${env.IMAGE_TAG}"
+            }
+        }
+        
+        stage('Push Images') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'docker-registry-credentials', passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
+                    sh "docker login ${DOCKER_REGISTRY} -u ${DOCKER_USERNAME} -p ${DOCKER_PASSWORD}"
+                    sh "docker push ${DOCKER_REGISTRY}/${APP_NAME}-frontend:${env.IMAGE_TAG}"
+                    sh "docker push ${DOCKER_REGISTRY}/${APP_NAME}-backend:${env.IMAGE_TAG}"
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            when {
+                anyOf {
+                    environment name: 'ENVIRONMENT', value: 'dev'
+                    environment name: 'ENVIRONMENT', value: 'qa'
+                    expression { 
+                        return params.ENVIRONMENT == 'staging' || params.ENVIRONMENT == 'prod'
+                    }
+                }
+            }
+            steps {
+                script {
+                    if (params.ENVIRONMENT == 'prod') {
+                        timeout(time: 10, unit: 'MINUTES') {
+                            input message: 'Deploy to production?', ok: 'Yes'
+                        }
+                    }
+                    
+                    sh "ci-cd/scripts/deploy.sh --env ${params.ENVIRONMENT} --tag ${env.IMAGE_TAG}"
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            when {
+                anyOf {
+                    environment name: 'ENVIRONMENT', value: 'dev'
+                    environment name: 'ENVIRONMENT', value: 'qa'
+                }
+            }
+            steps {
+                sh "ci-cd/scripts/run-integration-tests.sh --env ${params.ENVIRONMENT}"
+            }
+        }
+        
+        stage('Performance Tests') {
+            when {
+                environment name: 'ENVIRONMENT', value: 'staging'
+            }
+            steps {
+                sh "ci-cd/scripts/run-performance-tests.sh --env ${params.ENVIRONMENT}"
+            }
+            post {
+                always {
+                    publishHTML(target: [
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'performance-reports',
+                        reportFiles: 'index.html',
+                        reportName: 'Performance Test Report'
+                    ])
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            slackSend(
+                channel: "${SLACK_CHANNEL}",
+                color: 'good',
+                message: "✅ *Build Successful:* ${env.JOB_NAME} #${env.BUILD_NUMBER} - ${params.ENVIRONMENT} - ${env.IMAGE_TAG}\n*Details:* ${env.BUILD_URL}"
+            )
+        }
+        failure {
+            slackSend(
+                channel: "${SLACK_CHANNEL}",
+                color: 'danger',
+                message: "❌ *Build Failed:* ${env.JOB_NAME} #${env.BUILD_NUMBER} - ${params.ENVIRONMENT}\n*Details:* ${env.BUILD_URL}"
+            )
+        }
+    }
+}
